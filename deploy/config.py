@@ -1,8 +1,11 @@
 import copy
+import os
+import subprocess
+import sys
 from typing import Optional, Union
 
-from deploy.logger import logger
-from deploy.utils import *
+from deploy.Windows.logger import logger
+from deploy.Windows.utils import DEPLOY_CONFIG, DEPLOY_TEMPLATE, cached_property, poor_yaml_read, poor_yaml_write
 
 
 class ExecutionError(Exception):
@@ -17,6 +20,7 @@ class ConfigModel:
     GitProxy: Optional[str] = None
     SSLVerify: bool = False
     AutoUpdate: bool = True
+    KeepLocalChanges: bool = False
 
     # Python
     PythonExecutable: str = "./toolkit/python.exe"
@@ -52,15 +56,15 @@ class ConfigModel:
 
     # Webui
     WebuiHost: str = "0.0.0.0"
-    WebuiPort: int = 22267
-    WebuiSSLKey: Optional[str] = None
-    WebuiSSLCert: Optional[str] = None
+    WebuiPort: int = 22367
     Language: str = "en-US"
     Theme: str = "default"
     DpiScaling: bool = True
     Password: Optional[str] = None
     CDN: Union[str, bool] = False
     Run: Optional[str] = None
+    AppAsarUpdate: bool = True
+    NoSandbox: bool = True
 
     # Dynamic
     GitOverCdn: bool = False
@@ -91,9 +95,6 @@ class DeployConfig(ConfigModel):
         logger.info(f"Rest of the configs are the same as default")
 
     def read(self):
-        """
-        Read and update deploy config, copy `self.configs` to properties.
-        """
         self.config = poor_yaml_read(DEPLOY_TEMPLATE)
         self.config_template = copy.deepcopy(self.config)
         origin = poor_yaml_read(self.file)
@@ -115,55 +116,71 @@ class DeployConfig(ConfigModel):
         """
         Redirect deploy config, must be called after each `read()`
         """
-        if self.Repository in [
-            'https://gitee.com/LmeSzinc/AzurLaneAutoScript',
-            'https://gitee.com/lmeszinc/azur-lane-auto-script-mirror',
-            'https://e.coding.net/llop18870/alas/AzurLaneAutoScript.git',
-            'https://e.coding.net/saarcenter/alas/AzurLaneAutoScript.git',
-            'https://git.saarcenter.com/LmeSzinc/AzurLaneAutoScript.git',
-        ]:
-            self.Repository = 'git://git.lyoko.io/AzurLaneAutoScript'
-            self.config['Repository'] = 'git://git.lyoko.io/AzurLaneAutoScript'
-        if self.PypiMirror in [
-            'https://pypi.tuna.tsinghua.edu.cn/simple'
-        ]:
-            self.PypiMirror = 'https://mirrors.aliyun.com/pypi/simple'
-            self.config['PypiMirror'] = 'https://mirrors.aliyun.com/pypi/simple'
-
         # Bypass webui.config.DeployConfig.__setattr__()
         # Don't write these into deploy.yaml
-        super().__setattr__(
-            'GitOverCdn',
-            self.Repository == 'git://git.lyoko.io/AzurLaneAutoScript' and self.Branch == 'master'
-        )
-        if self.Repository in ['global']:
-            super().__setattr__('Repository', 'https://github.com/LmeSzinc/AzurLaneAutoScript')
-        if self.Repository in ['cn']:
-            super().__setattr__('Repository', 'git://git.lyoko.io/AzurLaneAutoScript')
+        super().__setattr__('GitOverCdn', self.Repository in ['cn'])
+        if self.Repository in ['global', 'cn']:
+            super().__setattr__('Repository', 'https://github.com/LmeSzinc/StarRailCopilot')
 
-    def filepath(self, key):
+    def filepath(self, path):
         """
         Args:
-            key (str):
+            path (str):
 
         Returns:
             str: Absolute filepath.
         """
+        if os.path.isabs(path):
+            return path
+
         return (
-            os.path.abspath(os.path.join(self.root_filepath, self.config[key]))
+            os.path.abspath(os.path.join(self.root_filepath, path))
             .replace(r"\\", "/")
             .replace("\\", "/")
-            .replace('"', '"')
         )
 
     @cached_property
     def root_filepath(self):
         return (
-            os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
             .replace(r"\\", "/")
             .replace("\\", "/")
-            .replace('"', '"')
         )
+
+    @cached_property
+    def adb(self) -> str:
+        exe = self.filepath(self.AdbExecutable)
+        if os.path.exists(exe):
+            return exe
+
+        logger.warning(f'AdbExecutable: {exe} does not exist, use `adb` instead')
+        return 'adb'
+
+    @cached_property
+    def git(self) -> str:
+        exe = self.filepath(self.GitExecutable)
+        if os.path.exists(exe):
+            return exe
+
+        logger.warning(f'GitExecutable: {exe} does not exist, use `git` instead')
+        return 'git'
+
+    @cached_property
+    def python(self) -> str:
+        exe = self.filepath(self.PythonExecutable)
+        if os.path.exists(exe):
+            return exe
+
+        current = sys.executable.replace("\\", "/")
+        logger.warning(f'PythonExecutable: {exe} does not exist, use current python instead: {current}')
+        return current
+
+    @cached_property
+    def requirements_file(self) -> str:
+        if self.RequirementsFile == 'requirements.txt':
+            return 'requirements.txt'
+        else:
+            return self.filepath(self.RequirementsFile)
 
     def execute(self, command, allow_failure=False, output=True):
         """
@@ -192,6 +209,26 @@ class DeployConfig(ConfigModel):
         else:
             logger.info(f"[ success ]")
             return True
+
+    def subprocess_execute(self, cmd, timeout=10):
+        """
+        Args:
+            cmd (list[str]):
+            timeout:
+
+        Returns:
+            str:
+        """
+        logger.info(' '.join(cmd))
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+            process.kill()
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            logger.info(f'TimeoutExpired, stdout={stdout}, stderr={stderr}')
+        return stdout.decode()
 
     def show_error(self, command=None):
         logger.hr("Update failed", 0)
